@@ -75,6 +75,11 @@ function App() {
   const [uploads, setUploads] = useState<Record<string, UploadRecord>>({});
   const [downloads, setDownloads] = useState<Record<string, DownloadRecord>>({});
 
+  const setCurrentFileListTransferId = (value: string) => {
+    fileListTransferIdRef.current = value;
+    setFileListTransferId(value);
+  };
+
   const agentOrder = buildAgentOrder(agents, historyCache);
   const selectedAgent = selectedAgentId ? agents[selectedAgentId] : undefined;
   const selectedHistory = historyEntries[historySelected] ?? null;
@@ -90,10 +95,6 @@ function App() {
   useEffect(() => {
     historyAgentIdRef.current = historyAgentId;
   }, [historyAgentId]);
-
-  useEffect(() => {
-    fileListTransferIdRef.current = fileListTransferId;
-  }, [fileListTransferId]);
 
   useEffect(() => {
     downloadsRef.current = downloads;
@@ -215,12 +216,15 @@ function App() {
         if (parsed.event === 'history:list:result') {
           const payload = parsed.payload as HistoryResult;
           startTransition(() => {
-            setHistoryCache((current) => ({
-              ...current,
-              [payload.agentId]: payload.entries,
-            }));
+            setHistoryCache((current) => {
+              const merged = mergeHistoryEntries(current[payload.agentId] ?? [], payload.entries);
+              return {
+                ...current,
+                [payload.agentId]: merged,
+              };
+            });
             setHistoryAgentId(payload.agentId);
-            setHistoryEntries(payload.entries);
+            setHistoryEntries((current) => mergeHistoryEntries(current, payload.entries));
             setHistorySelected(0);
             setStatusLine(
               payload.entries.length > 0
@@ -259,7 +263,7 @@ function App() {
           startTransition(() => {
             applyFileEvent(event, {
               fileListTransferId: fileListTransferIdRef.current,
-              setFileListTransferId,
+              setFileListTransferId: setCurrentFileListTransferId,
               setFileAgentId,
               setFileBrowserPath,
               setFileEntries,
@@ -375,6 +379,10 @@ function App() {
       return;
     }
 
+    if (!socketConnected || !gatewayStatus.connected) {
+      return;
+    }
+
     const agentId = liveSelectedAgentId;
     if (!agentId) {
       setStatusLine('No agent selected for files.');
@@ -387,11 +395,20 @@ function App() {
     }
 
     if (fileAgentId !== agentId) {
+      if (fileListTransferId) {
+        return;
+      }
       setFileEntries([]);
       setSelectedRemoteEntry(null);
       setFileBrowserPath('.');
       setRemoteUploadTarget('.');
-      requestRemoteList(socketRef.current, agentId, '.', setFileListTransferId, setStatusLine);
+      requestRemoteList(
+        socketRef.current,
+        agentId,
+        '.',
+        setCurrentFileListTransferId,
+        setStatusLine,
+      );
       return;
     }
 
@@ -400,7 +417,7 @@ function App() {
         socketRef.current,
         agentId,
         fileBrowserPath,
-        setFileListTransferId,
+        setCurrentFileListTransferId,
         setStatusLine,
       );
     }
@@ -411,7 +428,9 @@ function App() {
     fileBrowserPath,
     fileEntries.length,
     fileListTransferId,
+    gatewayStatus.connected,
     liveSelectedAgentId,
+    socketConnected,
   ]);
 
   function handleDispatchCommand() {
@@ -459,21 +478,34 @@ function App() {
   }
 
   function handleBrowseDirectory(path: string) {
-    if (!fileAgentId) {
+    const targetAgentId = fileAgentId || liveSelectedAgentId;
+    if (!targetAgentId) {
       return;
     }
-    requestRemoteList(socketRef.current, fileAgentId, path, setFileListTransferId, setStatusLine);
+    setFileBrowserPath(path);
+    setFileEntries([]);
+    setSelectedRemoteEntry(null);
+    requestRemoteList(
+      socketRef.current,
+      targetAgentId,
+      path,
+      setCurrentFileListTransferId,
+      setStatusLine,
+    );
   }
 
   function handleRefreshFiles() {
-    if (!fileAgentId) {
+    const targetAgentId = fileAgentId || liveSelectedAgentId;
+    if (!targetAgentId) {
       return;
     }
+    setFileEntries([]);
+    setSelectedRemoteEntry(null);
     requestRemoteList(
       socketRef.current,
-      fileAgentId,
+      targetAgentId,
       fileBrowserPath,
-      setFileListTransferId,
+      setCurrentFileListTransferId,
       setStatusLine,
     );
   }
@@ -484,7 +516,8 @@ function App() {
 
   async function handleUploadSelection(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
-    if (!file || !fileAgentId) {
+    const targetAgentId = fileAgentId || liveSelectedAgentId;
+    if (!file || !targetAgentId) {
       return;
     }
 
@@ -506,7 +539,7 @@ function App() {
 
     sendEvent(socketRef.current, 'file:upload:start', {
       transferId,
-      agentId: fileAgentId,
+      agentId: targetAgentId,
       path: remotePath,
       message: file.name,
       totalBytes: file.size,
@@ -519,7 +552,7 @@ function App() {
       const bytes = new Uint8Array(await chunk.arrayBuffer());
       sendEvent(socketRef.current, 'file:upload:chunk', {
         transferId,
-        agentId: fileAgentId,
+        agentId: targetAgentId,
         path: remotePath,
         data: bytesToBase64(bytes),
       });
@@ -541,14 +574,15 @@ function App() {
 
     sendEvent(socketRef.current, 'file:upload:end', {
       transferId,
-      agentId: fileAgentId,
+      agentId: targetAgentId,
       path: remotePath,
     });
     event.target.value = '';
   }
 
   function handleDownloadEntry() {
-    if (!fileAgentId || !selectedRemoteEntry || selectedRemoteEntry.isDir) {
+    const targetAgentId = fileAgentId || liveSelectedAgentId;
+    if (!targetAgentId || !selectedRemoteEntry || selectedRemoteEntry.isDir) {
       return;
     }
 
@@ -565,11 +599,11 @@ function App() {
     appendFileLog(
       setFileLog,
       'neutral',
-      `Downloading ${selectedRemoteEntry.path} from ${shortAgentId(fileAgentId)}`,
+      `Downloading ${selectedRemoteEntry.path} from ${shortAgentId(targetAgentId)}`,
     );
     sendEvent(socketRef.current, 'file:download', {
       transferId,
-      agentId: fileAgentId,
+      agentId: targetAgentId,
       path: selectedRemoteEntry.path,
     });
   }
@@ -706,7 +740,10 @@ function applyOperatorEvent({
       break;
     case 'history_updated':
       try {
-        const entry = JSON.parse(event.payload) as HistoryEntry;
+        const entry = parseHistoryEntryPayload(event.payload);
+        if (!entry) {
+          break;
+        }
         setHistoryCache((current) => {
           const existing = current[event.agentId] ?? [];
           const merged = [entry, ...existing.filter((item) => item.taskId !== entry.taskId)].slice(
@@ -733,6 +770,70 @@ function applyOperatorEvent({
   if (event.type !== 'output' && event.type !== 'history_updated') {
     setStatusLine(event.payload || event.type);
   }
+}
+
+function parseHistoryEntryPayload(payload: string): HistoryEntry | null {
+  if (!payload) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(payload) as
+      | Partial<HistoryEntry>
+      | {
+          task_id?: string;
+          agent_id?: string;
+          executed_at?: number;
+          completed_at?: number;
+          command?: string;
+          args?: string;
+          output?: string;
+        };
+
+    const taskId =
+      (parsed as Partial<HistoryEntry>).taskId || (parsed as { task_id?: string }).task_id || '';
+    const agentId =
+      (parsed as Partial<HistoryEntry>).agentId || (parsed as { agent_id?: string }).agent_id || '';
+    if (!taskId || !agentId) {
+      return null;
+    }
+
+    return {
+      taskId,
+      agentId,
+      command: (parsed as Partial<HistoryEntry>).command || '',
+      args: (parsed as Partial<HistoryEntry>).args || '',
+      output: (parsed as Partial<HistoryEntry>).output || '',
+      executedAt:
+        (parsed as Partial<HistoryEntry>).executedAt ||
+        (parsed as { executed_at?: number }).executed_at ||
+        0,
+      completedAt:
+        (parsed as Partial<HistoryEntry>).completedAt ||
+        (parsed as { completed_at?: number }).completed_at ||
+        0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function mergeHistoryEntries(current: HistoryEntry[], incoming: HistoryEntry[]) {
+  if (incoming.length === 0) {
+    return current;
+  }
+
+  const byTaskId = new Map<string, HistoryEntry>();
+  for (const item of current) {
+    byTaskId.set(item.taskId, item);
+  }
+  for (const item of incoming) {
+    byTaskId.set(item.taskId, item);
+  }
+
+  return [...byTaskId.values()]
+    .sort((left, right) => right.executedAt - left.executedAt)
+    .slice(0, 200);
 }
 
 function applyShellEvent(
@@ -779,7 +880,7 @@ function applyFileEvent(
   event: FileEvent,
   handlers: {
     fileListTransferId: string;
-    setFileListTransferId: Dispatch<SetStateAction<string>>;
+    setFileListTransferId: (value: string) => void;
     setFileAgentId: Dispatch<SetStateAction<string>>;
     setFileBrowserPath: Dispatch<SetStateAction<string>>;
     setFileEntries: Dispatch<SetStateAction<RemoteFileEntry[]>>;
@@ -908,16 +1009,21 @@ function requestRemoteList(
   socket: WebSocket | null,
   agentId: string,
   path: string,
-  setTransferId: Dispatch<SetStateAction<string>>,
+  setTransferId: (value: string) => void,
   setStatusLine: Dispatch<SetStateAction<string>>,
 ) {
   const transferId = createId();
   setTransferId(transferId);
-  sendEvent(socket, 'file:list', {
+  const sent = sendEvent(socket, 'file:list', {
     transferId,
     agentId,
     path,
   });
+  if (!sent) {
+    setTransferId('');
+    setStatusLine('Gateway not connected. Retry file listing.');
+    return;
+  }
   setStatusLine(`Loading ${path} for ${shortAgentId(agentId)}...`);
 }
 
@@ -979,8 +1085,12 @@ function isAgentLive(status: AgentStatus) {
   return status === 'ALIVE' || status === 'IDLE' || status === 'BUSY';
 }
 
-function shortAgentId(id: string) {
-  return id.length <= 8 ? id : id.slice(0, 8);
+function shortAgentId(id?: string | null) {
+  const safe = (id || '').trim();
+  if (!safe) {
+    return 'unknown';
+  }
+  return safe.length <= 8 ? safe : safe.slice(0, 8);
 }
 
 function extractStatus(payload: string) {
@@ -1101,9 +1211,10 @@ function parseEnvelope(data: string) {
 
 function sendEvent(socket: WebSocket | null, event: string, payload: unknown) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    return;
+    return false;
   }
   socket.send(JSON.stringify({ event, payload }));
+  return true;
 }
 
 function resolveRemotePath(base: string, target: string) {

@@ -294,7 +294,14 @@ func (s *session) handleEnvelope(envelope wsEnvelope) error {
 		req.Type = mapFileEventToType(envelope.Event)
 		req.TransferID = ensureTransferID(req.TransferID)
 		if err := s.sendFile(req); err != nil {
-			return err
+			s.emit("file:event", fileEventPayload{
+				Type:       "error",
+				TransferID: req.TransferID,
+				AgentID:    req.AgentID,
+				Path:       req.Path,
+				Message:    err.Error(),
+			})
+			return nil
 		}
 		if req.Type == "list" || req.Type == "download" || req.Type == "upload_start" {
 			s.emit("file:accepted", acceptedPayload{

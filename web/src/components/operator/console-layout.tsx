@@ -139,8 +139,8 @@ function ConsoleLayout(props: ConsoleLayoutProps) {
   } = props;
 
   return (
-    <main className="min-h-screen bg-background text-foreground">
-      <div className="mx-auto grid min-h-screen max-w-7xl gap-4 p-4 md:p-6">
+    <main className="h-screen overflow-hidden bg-background text-foreground">
+      <div className="mx-auto grid h-full max-w-7xl grid-rows-[auto_minmax(0,1fr)_auto] gap-4 overflow-hidden p-4 md:p-6">
         <Card>
           <CardHeader className="flex-row items-center justify-between gap-3">
             <div className="space-y-1">
@@ -163,12 +163,12 @@ function ConsoleLayout(props: ConsoleLayoutProps) {
           </CardContent>
         </Card>
 
-        <div className="grid items-stretch gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
-          <Card>
+        <div className="grid min-h-0 items-stretch gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
+          <Card className="flex min-h-0 flex-col">
             <CardHeader>
               <CardTitle className="text-xs uppercase tracking-wider">Agents</CardTitle>
             </CardHeader>
-            <CardContent className="space-y-2">
+            <CardContent className="min-h-0 space-y-2 overflow-auto">
               {agentOrder.length === 0 ? (
                 <p className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
                   No agents
@@ -207,7 +207,7 @@ function ConsoleLayout(props: ConsoleLayoutProps) {
             </CardContent>
           </Card>
 
-          <Card className="flex min-h-[70vh] flex-col">
+          <Card className="flex min-h-0 flex-col">
             <CardHeader className="gap-3">
               <div className="flex flex-wrap gap-2">
                 <TabButton
@@ -248,7 +248,7 @@ function ConsoleLayout(props: ConsoleLayoutProps) {
                 <div className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_auto] gap-3">
                   <pre
                     ref={liveLogRef}
-                    className="h-full min-h-0 overflow-auto rounded-md border bg-muted/30 p-3 text-xs leading-6"
+                    className="h-full min-h-0 overflow-auto rounded-md border bg-muted/30 p-3 text-xs leading-6 whitespace-pre-wrap break-words"
                   >
                     {liveLog}
                   </pre>
@@ -310,7 +310,7 @@ function ConsoleLayout(props: ConsoleLayoutProps) {
                         <div>No history selected</div>
                       )}
                     </div>
-                    <pre className="overflow-auto rounded-md border bg-muted/30 p-3 text-xs leading-6">
+                    <pre className="h-full min-h-0 overflow-auto rounded-md border bg-muted/30 p-3 text-xs leading-6 whitespace-pre-wrap break-words">
                       {selectedHistory?.output || 'No output'}
                     </pre>
                   </div>
@@ -321,7 +321,7 @@ function ConsoleLayout(props: ConsoleLayoutProps) {
                 <div className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_auto_auto] gap-3">
                   <pre
                     ref={shellLogRef}
-                    className="h-full min-h-0 overflow-auto rounded-md border bg-muted/30 p-3 text-xs leading-6"
+                    className="h-full min-h-0 overflow-auto rounded-md border bg-muted/30 p-3 text-xs leading-6 whitespace-pre-wrap break-words"
                   >
                     {shellOutput}
                   </pre>
